@@ -775,12 +775,44 @@ class DeepseekV4Model(TextModel):
                     consumed.extend(self._write_hash_routing_tensors())
                     break
 
-        for bid in range(self.block_count):
-            if self.mtp_only and bid < main_layers:
-                continue
-            consumed.extend(self._write_mxfp4_expert_tensor(bid, "w1", gguf.MODEL_TENSOR.FFN_GATE_EXP))
-            consumed.extend(self._write_mxfp4_expert_tensor(bid, "w2", gguf.MODEL_TENSOR.FFN_DOWN_EXP))
-            consumed.extend(self._write_mxfp4_expert_tensor(bid, "w3", gguf.MODEL_TENSOR.FFN_UP_EXP))
+        # 检测是否存在 MXFP4 量化所需的 scale 张量
+        has_mxfp4 = any(".ffn.experts." in name and ".scale" in name for name in self.model_tensors)
+
+        if has_mxfp4:
+            for bid in range(self.block_count):
+                if self.mtp_only and bid < main_layers:
+                    continue
+                consumed.extend(self._write_mxfp4_expert_tensor(bid, "w1", gguf.MODEL_TENSOR.FFN_GATE_EXP))
+                consumed.extend(self._write_mxfp4_expert_tensor(bid, "w2", gguf.MODEL_TENSOR.FFN_DOWN_EXP))
+                consumed.extend(self._write_mxfp4_expert_tensor(bid, "w3", gguf.MODEL_TENSOR.FFN_UP_EXP))
+        else:
+        # ========== 新增：非 MXFP4 模型，堆叠专家权重 ==========
+            n_experts = self.hparams.get("n_routed_experts", 0)
+            if n_experts > 0:
+                for bid in range(self.block_count):
+                    if self.mtp_only and bid < main_layers:
+                        continue
+                    # 依次处理 w1, w2, w3
+                    for proj, gguf_suffix in [
+                        ("w1", "ffn_gate_exps"),
+                        ("w2", "ffn_down_exps"),
+                        ("w3", "ffn_up_exps")
+                    ]:
+                        expert_weights = []
+                        expert_names = []
+                        for eid in range(n_experts):
+                            weight_name = f"layers.{bid}.ffn.experts.{eid}.{proj}.weight"
+                            if weight_name not in self.model_tensors:
+                                raise KeyError(f"Missing routed expert tensor {weight_name}")
+                            expert_weights.append(LazyTorchTensor.to_eager(self.model_tensors[weight_name]()))
+                            expert_names.append(weight_name)
+                        # 堆叠为 [num_experts, ...]
+                        stacked = torch.stack(expert_weights, dim=0)
+                        # 生成 GGUF 张量名称（复数）
+                        gguf_name = f"blk.{bid}.{gguf_suffix}.weight"
+                        yield (gguf_name, stacked)
+                        consumed.extend(expert_names)
+            # ========== 非 MXFP4 堆叠结束 ==========
 
         for bid in range(main_layers, self.block_count):
             e_name = f"layers.{bid}.nextn.e_proj.weight"
@@ -875,6 +907,9 @@ class DeepseekV4Model(TextModel):
         raise ValueError(f"Unsupported DeepSeek-V4 tensor {name!r}")
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name.startswith("blk."):
+            return [(name, data_torch)]
+        
         if re.match(r"layers\.\d+\.ffn\.experts\.\d+\.w[123]\.(weight|scale)$", name):
             return []
 
