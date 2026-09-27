@@ -405,6 +405,10 @@ static ggml_cuda_device_info ggml_cuda_init() {
         }
     }
 
+    // print the fast-path switch state once at backend init (ggml-level INFO,
+    // visible at default verbosity, like the CUDA device info above)
+    ggml_cuda_fast_ops_print_startup();
+
     return info;
 }
 
@@ -1892,6 +1896,15 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
         return false;
     }
 
+    if (ggml_cuda_fast_ops_enabled("GGML_CUDA_FAST_MOE_MM")
+        && ggml_cuda_fast_ops_enabled("GGML_CUDA_FAST_MOEMM_O1O2")
+        && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+        && ggml_is_quantized(src0->type)
+        && src1->ne[2] >= MMQ_DP4A_MAX_BATCH_SIZE
+        && ggml_cuda_should_use_mmq(src0->type, cc, /*ne11=*/0, /*n_experts=*/src0->ne[2])) {
+        return false;
+    }
+
     if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
         return false;
     }
@@ -1930,6 +1943,19 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+            ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
+            return;
+        }
+
+        // O1 fast path: for T>=64 bypass the sync-fallback cliff and go directly to mmq.
+        // The mmq kernel itself supports arbitrary T (J<=128 with jt tiling); the old
+        // should_use_mmq threshold (ne11<64) was a dp4a-era heuristic that ignored n_experts.
+        if (ggml_cuda_fast_ops_enabled("GGML_CUDA_FAST_MOE_MM")
+            && ggml_cuda_fast_ops_enabled("GGML_CUDA_FAST_MOEMM_O1O2")
+            && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+            && ggml_is_quantized(src0->type)
+            && ne12 >= MMQ_DP4A_MAX_BATCH_SIZE
+            && ggml_cuda_should_use_mmq(src0->type, cc, /*ne11=*/0, /*n_experts=*/ne02)) {
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }

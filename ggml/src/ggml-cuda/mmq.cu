@@ -5,6 +5,29 @@
 
 #include <cstdint>
 
+
+// Re-index the quantized activation (block_q8_1_mmq) rows from the global compact-row
+// layout into a per-bucket local compact-row layout, so that the mmq kernel can keep its
+// fast contiguous y loads.
+//   src_y layout: [k_block][global_row][block]
+//   dst_y layout: [k_block][local_row][block]
+// row_ids maps local row -> global row.  The local buffer must be zeroed beforehand; only
+// the first n_local_rows rows of each k-block are written.
+static __global__ void mmq_reindex_y_kernel(
+        const int * __restrict__ src_y, int * __restrict__ dst_y,
+        const int32_t * __restrict__ row_ids,
+        const int n_local_rows, const int n_global_rows, const int dst_stride_rows,
+        const int n_kblocks, const int sz) {
+    const int kb = blockIdx.x;
+    const int r  = blockIdx.y;
+    const int gr = row_ids[r];
+    const int * src = src_y + ((int64_t) kb*n_global_rows + gr)*sz;
+    int * dst = dst_y + ((int64_t) kb*dst_stride_rows + r)*sz;
+    for (int i = threadIdx.x; i < sz; i += blockDim.x) {
+        dst[i] = src[i];
+    }
+}
+
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
         case GGML_TYPE_Q1_0:
@@ -166,7 +189,7 @@ void ggml_cuda_mul_mat_q(
         const int64_t s13 = ne12*s12;
 
         const mmq_args args = {
-            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
+            src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, nullptr, dst_d,
             src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
@@ -244,9 +267,178 @@ void ggml_cuda_mul_mat_q(
                                          ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
     const int64_t s13 = ne12*s12;
 
+    // O2 fast path: per-expert J bucketing for the MoE ids branch with T>=64.
+    // Split experts by col_diff (= how many active rows each expert gets) into a few
+    // buckets, each launched with the smallest J >= bucket max col_diff.  This cuts the
+    // J/col_diff mma waste that the global-J>=T launch pays for every expert.
+    // y is re-laid out per bucket (gather) so the mmq kernel keeps its contiguous loads;
+    // only the weight expert id needs indirection (expert_ids).
+    //
+    // Bucketing is computed on host from `ids` (a stable graph input, NOT a pool temp),
+    // so it does NOT race with concurrent streams / CUDA graph capture the way reading
+    // back the pool-temp expert_bounds/ids_dst did.  Still skip while capturing: the
+    // host D2H of `ids` is not graph-capturable.
+    cudaStreamCaptureStatus capture_status;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+    const bool is_capturing = capture_status != cudaStreamCaptureStatusNone;
+
+    const bool fast_bucket = ggml_cuda_fast_ops_enabled("GGML_CUDA_FAST_MOE_MM")
+        && ggml_cuda_fast_ops_enabled("GGML_CUDA_FAST_MOEMM_O1O2")
+        && ids != nullptr
+        && ne12 >= MMQ_DP4A_MAX_BATCH_SIZE
+        && !use_native_fp4
+        && !is_capturing;
+
+    if (fast_bucket) {
+        const int n_experts     = (int) ne02;
+        const int n_expert_used = (int) ids->ne[0];
+        const int n_tokens      = (int) ne12;
+        const int n_rows_g      = n_tokens * n_expert_used;
+        const int n_kblocks     = (int)(ne10_padded / QK8_1_MMQ);
+        const int sz            = (int)(sizeof(block_q8_1_mmq) / sizeof(int));
+        const int si1           = (int)(ids->nb[1] / ggml_element_size(ids));
+
+        GGML_ASSERT(n_experts > 0 && n_experts < 1000000);
+        GGML_ASSERT(n_rows_g  > 0 && n_rows_g  < 100000000);
+
+        // read the routing ids (stable graph input) to host once
+        std::vector<int32_t> ids_host((size_t) n_tokens * si1);
+        CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, (size_t) n_tokens * si1 * sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        // per-expert: count and dst columns (it*topk+iex), in token order (matches mm_ids_helper)
+        std::vector<int> counts(n_experts, 0);
+        std::vector<int> exp_base(n_experts, 0);
+        std::vector<std::vector<int32_t>> dst_per_exp(n_experts);
+        int compact = 0;
+        for (int it = 0; it < n_tokens; ++it) {
+            for (int iex = 0; iex < n_expert_used; ++iex) {
+                const int e = ids_host[(size_t) it*si1 + iex];
+                GGML_ASSERT(e >= 0 && e < n_experts);
+                counts[e]++;
+                dst_per_exp[e].push_back(it*n_expert_used + iex);
+                ++compact;
+            }
+        }
+        GGML_ASSERT(compact == n_rows_g);
+        int acc = 0;
+        for (int e = 0; e < n_experts; ++e) { exp_base[e] = acc; acc += counts[e]; }
+
+        // Bucket thresholds (J per bucket); experts with col_diff > 64 go to the last bucket
+        // and switch_J will pick a larger J there.
+        static const int thresholds[] = {16, 32, 48, 64};
+        const int nbuckets = 4;
+        std::vector<std::vector<int>> bucket_exp(nbuckets);
+        int bucket_max[4] = {0, 0, 0, 0};
+        for (int e = 0; e < n_experts; ++e) {
+            if (counts[e] == 0) {
+                continue;
+            }
+            int b = 0;
+            while (b < nbuckets - 1 && counts[e] > thresholds[b]) {
+                ++b;
+            }
+            bucket_exp[b].push_back(e);
+            if (counts[e] > bucket_max[b]) {
+                bucket_max[b] = counts[e];
+            }
+        }
+
+        std::vector<int> nE(nbuckets, 0), nrows(nbuckets, 0);
+        std::vector<std::vector<int32_t>> h_exp_ids(nbuckets), h_bounds_l(nbuckets), h_ids_dst_l(nbuckets), h_row_ids(nbuckets);
+        for (int b = 0; b < nbuckets; ++b) {
+            if (bucket_exp[b].empty()) {
+                continue;
+            }
+            int lr = 0;
+            for (int e : bucket_exp[b]) {
+                lr += counts[e];
+            }
+            nE[b]    = (int) bucket_exp[b].size();
+            nrows[b] = lr;
+            h_exp_ids[b].resize(nE[b]);
+            h_bounds_l[b].resize(nE[b] + 1);
+            h_ids_dst_l[b].resize(lr);
+            h_row_ids[b].resize(lr);
+            int r = 0;
+            h_bounds_l[b][0] = 0;
+            for (int i = 0; i < nE[b]; ++i) {
+                const int e = bucket_exp[b][i];
+                h_exp_ids[b][i] = e;
+                h_bounds_l[b][i] = r;
+                for (int k = 0; k < counts[e]; ++k) {
+                    h_ids_dst_l[b][r] = dst_per_exp[e][k];
+                    h_row_ids[b][r]   = exp_base[e] + k; // global compact row (expert-sorted)
+                    ++r;
+                }
+                h_bounds_l[b][i + 1] = r;
+            }
+        }
+
+        // Padding rows per k-block so the mmq kernel can read J columns past the last row.
+        const int pad = 128; // >= max J
+        for (int b = 0; b < nbuckets; ++b) {
+            if (nE[b] == 0) {
+                continue;
+            }
+            const int J          = bucket_max[b];
+            const int stride_rows = nrows[b] + pad;
+            const int nbuf_y      = n_kblocks * stride_rows * sz;
+
+            ggml_cuda_pool_alloc<int>    d_y(ctx.pool(), nbuf_y);
+            ggml_cuda_pool_alloc<int32_t> d_exp(ctx.pool(), nE[b]);
+            ggml_cuda_pool_alloc<int32_t> d_bounds(ctx.pool(), nE[b] + 1);
+            ggml_cuda_pool_alloc<int32_t> d_ids(ctx.pool(), nrows[b]);
+            ggml_cuda_pool_alloc<int32_t> d_rows(ctx.pool(), nrows[b]);
+
+            CUDA_CHECK(cudaMemsetAsync(d_y.get(), 0, (size_t) nbuf_y*sizeof(int), stream));
+            CUDA_CHECK(cudaMemcpyAsync(d_exp.get(),   h_exp_ids[b].data(),   (size_t) nE[b]*sizeof(int32_t),        cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(d_bounds.get(), h_bounds_l[b].data(),  (size_t) (nE[b] + 1)*sizeof(int32_t),  cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(d_ids.get(),   h_ids_dst_l[b].data(), (size_t) nrows[b]*sizeof(int32_t),     cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(d_rows.get(),  h_row_ids[b].data(),   (size_t) nrows[b]*sizeof(int32_t),     cudaMemcpyHostToDevice, stream));
+
+            const dim3 gcopy((unsigned) n_kblocks, (unsigned) nrows[b]);
+            mmq_reindex_y_kernel<<<gcopy, 256, 0, stream>>>(
+                (const int *) src1_q8_1.get(), d_y.get(), d_rows.get(),
+                nrows[b], n_rows_g, stride_rows, n_kblocks, sz);
+            CUDA_CHECK(cudaGetLastError());
+
+            mmq_args bk_args;
+            bk_args.x = src0_d;
+            bk_args.type_x = src0->type;
+            bk_args.y = d_y.get();
+            bk_args.ids_dst = d_ids.get();
+            bk_args.expert_bounds = d_bounds.get();
+            bk_args.expert_ids = d_exp.get();
+            bk_args.dst = dst_d;
+            bk_args.y_scale = nullptr;
+            bk_args.ncols_x = ne00;
+            bk_args.nrows_x = ne01;
+            bk_args.ncols_dst = nrows[b];
+            bk_args.stride_row_x = s01;
+            bk_args.ncols_y = stride_rows;   // y row stride per k-block
+            bk_args.nrows_dst = s1;          // dst column stride
+            bk_args.nchannels_x = nE[b];
+            bk_args.nchannels_y = nE[b];
+            bk_args.stride_channel_x = s02;
+            bk_args.stride_channel_y = 0;    // unused in the ids branch
+            bk_args.stride_channel_dst = s2;
+            bk_args.nsamples_x = ne03;
+            bk_args.nsamples_y = ne13;
+            bk_args.stride_sample_x = s03;
+            bk_args.stride_sample_y = s13;
+            bk_args.stride_sample_dst = s3;
+            bk_args.ncols_max = J;           // max col_diff in bucket -> switch_J picks J>=J, ntx=1
+
+            ggml_cuda_mul_mat_q_switch_type(ctx, bk_args, stream);
+        }
+        return; // handled by the bucketed path
+    }
+
+
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
     const mmq_args args = {
-        src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
+        src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), nullptr, dst_d,
         src1_scale.ptr,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,

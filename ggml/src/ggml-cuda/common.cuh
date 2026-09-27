@@ -244,6 +244,62 @@ static const char * cu_get_error_str(CUresult err) {
         } while (0)
 #endif // !(defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 
+// Runtime switches for the optimized (hand-written) fast paths.
+//
+//   GGML_CUDA_FAST_OPS=0          master switch: disable every optimized fast path
+//   GGML_CUDA_FAST_<OP>=0|1       per-operator override, e.g. GGML_CUDA_FAST_SOFTMAX
+//
+// The fast paths are not arch-specific: the same kernels are compiled for all
+// supported architectures and pick their configuration at run time from the
+// device properties.  Defaulting to enabled keeps stock behaviour unless the
+// user explicitly opts out.
+static inline bool ggml_cuda_fast_ops_enabled(const char * op_flag) {
+    const char * master = getenv("GGML_CUDA_FAST_OPS");
+
+    const bool master_allows = !(master != nullptr && std::atoi(master) == 0);
+    const char * own = getenv(op_flag);
+    const bool enabled = master_allows && (own == nullptr || std::atoi(own) != 0);
+
+    return enabled;
+}
+
+// Print the fast-path switch state once, at CUDA backend init, so that it shows
+// up in the startup output.  Like the CUDA device info this is ggml-level INFO,
+// which common/log.cpp maps to LOG_LEVEL_INFO, so it is visible at the default
+// verbosity.  Extend `ops` as new operators are added.
+static inline void ggml_cuda_fast_ops_print_startup() {
+    const char * master = getenv("GGML_CUDA_FAST_OPS");
+    const bool master_allows = !(master != nullptr && std::atoi(master) == 0);
+
+    // per-operator fast paths currently wired into the CUDA backend
+    static const char * ops[] = {
+        "GGML_CUDA_FAST_SOFTMAX",
+    };
+
+    GGML_LOG_INFO("ggml_cuda: fast ops: GGML_CUDA_FAST_OPS=%s%s\n",
+                  master ? master : "unset",
+                  master_allows ? "" : " (master disabled)");
+    for (size_t i = 0; i < sizeof(ops) / sizeof(ops[0]); ++i) {
+        const char * own = getenv(ops[i]);
+        const bool enabled = master_allows && (own == nullptr || std::atoi(own) != 0);
+        GGML_LOG_INFO("ggml_cuda: fast ops for %s: %s (GGML_CUDA_FAST_OPS=%s)\n",
+                      ops[i], enabled ? "enabled" : "disabled",
+                      master ? master : "unset");
+    }
+
+    // MoE-MM fast paths have a parent operator switch plus a sub-switch for the current
+    // O1/O2 work.  Print the effective state so GGML_CUDA_FAST_MOE_MM=0 is not hidden.
+    const bool moe_mm_enabled = ggml_cuda_fast_ops_enabled("GGML_CUDA_FAST_MOE_MM");
+    const bool o1o2_enabled   = moe_mm_enabled && ggml_cuda_fast_ops_enabled("GGML_CUDA_FAST_MOEMM_O1O2");
+    GGML_LOG_INFO("ggml_cuda: fast ops for GGML_CUDA_FAST_MOE_MM: %s\n",
+                  moe_mm_enabled ? "enabled" : "disabled");
+    GGML_LOG_INFO("ggml_cuda: fast ops for GGML_CUDA_FAST_MOEMM_O1O2: %s (effective)\n",
+                  o1o2_enabled ? "enabled" : "disabled");
+    const bool o5_enabled = moe_mm_enabled && ggml_cuda_fast_ops_enabled("GGML_CUDA_FAST_MOEMM_O5");
+    GGML_LOG_INFO("ggml_cuda: fast ops for GGML_CUDA_FAST_MOEMM_O5: %s (effective)\n",
+                  o5_enabled ? "enabled" : "disabled");
+}
+
 #if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA)
 #define GGML_CUDA_ASSUME(x) __builtin_assume(x)
 #else

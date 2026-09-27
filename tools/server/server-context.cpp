@@ -804,6 +804,10 @@ public:
     // note: chat_params must not be refreshed upon existing sleeping state
     server_chat_params chat_params;
 
+    // protects chat_params so the runtime thinking-mode toggle (POST /props) and the
+    // concurrent chat/completions handlers do not race on it
+    std::mutex mutex_chat_params;
+
     server_state_callback_t callback_state = [](server_state, json) -> void {};
 
     server_context_impl() {
@@ -4513,7 +4517,7 @@ static json get_res_models(const server_context_meta & meta) {
     };
 }
 
-static json get_res_props(const server_context_meta & meta, const common_params & params, bool is_sleeping) {
+static json get_res_props(const server_context_meta & meta, const common_params & params, bool is_sleeping, bool enable_thinking) {
     // note: do NOT use ctx_server here, otherwise it's not possible to use this during sleep
 
     task_params tparams;
@@ -4541,6 +4545,7 @@ static json get_res_props(const server_context_meta & meta, const common_params 
         { "endpoint_slots",              params.endpoint_slots },
         { "endpoint_props",              params.endpoint_props },
         { "endpoint_metrics",            params.endpoint_metrics },
+        { "enable_thinking",             enable_thinking },
         { "ui",                          params.ui },
         { "ui_settings",                 meta.json_ui_settings },
         { "chat_template",               tmpl_default },
@@ -4725,18 +4730,52 @@ void server_routes::init_routes() {
             std::unique_lock<std::mutex> lock(mutex_cache);
             res->ok(cached_props);
         } else {
-            res->ok(get_res_props(*meta, params, false));
+            bool enable_thinking;
+            {
+                std::lock_guard<std::mutex> lock(ctx_server.mutex_chat_params);
+                enable_thinking = ctx_server.chat_params.enable_thinking;
+            }
+            res->ok(get_res_props(*meta, params, false, enable_thinking));
         }
         return res;
     };
 
-    this->post_props = [this](const server_http_req &) {
+    this->post_props = [this](const server_http_req & req) {
         auto res = create_response();
         if (!params.endpoint_props) {
             res->error(format_error_response("This server does not support changing global properties. Start it with `--props`", ERROR_TYPE_NOT_SUPPORTED));
             return res;
         }
         // update any props here
+
+        const json body = req.body.empty() ? json::object() : json::parse(req.body);
+        if (body.contains("enable_thinking")) {
+            const json & v = body.at("enable_thinking");
+            if (v.is_boolean()) {
+                const bool enable = v.get<bool>();
+                {
+                    std::lock_guard<std::mutex> lock(ctx_server.mutex_chat_params);
+                    ctx_server.chat_params.enable_thinking = enable;
+                    ctx_server.chat_params.chat_template_kwargs["enable_thinking"] = enable ? "true" : "false";
+                }
+                SRV_INF("%s: thinking mode %s\n", __func__, enable ? "enabled" : "disabled");
+            } else if (v.is_string() && v.get<std::string>() == "auto") {
+                {
+                    std::lock_guard<std::mutex> lock(ctx_server.mutex_chat_params);
+                    ctx_server.chat_params.chat_template_kwargs.erase("enable_thinking");
+                    // restore the template default: enabled only when the template supports thinking
+                    ctx_server.chat_params.enable_thinking =
+                        ctx_server.chat_params.use_jinja &&
+                        common_chat_templates_support_enable_thinking(ctx_server.chat_params.tmpls.get());
+                }
+                SRV_INF("%s: thinking mode auto\n", __func__);
+            } else {
+                res->error(format_error_response("\"enable_thinking\" must be a boolean or \"auto\"", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+        } else {
+            SRV_INF("%s: no known global property to update\n", __func__);
+        }
 
         res->ok({{ "success", true }});
         return res;
@@ -4848,10 +4887,12 @@ void server_routes::init_routes() {
         auto res = create_response();
         std::vector<raw_buffer> files;
         json body = json::parse(req.body);
-        json body_parsed = oaicompat_chat_params_parse(
-            body,
-            meta->chat_params,
-            files);
+        // use the live chat params so the runtime thinking-mode toggle (POST /props) is honored
+        json body_parsed;
+        {
+            std::lock_guard<std::mutex> lock(ctx_server.mutex_chat_params);
+            body_parsed = oaicompat_chat_params_parse(body, ctx_server.chat_params, files);
+        }
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
@@ -4907,10 +4948,11 @@ void server_routes::init_routes() {
         json body = server_chat_convert_responses_to_chatcmpl(json::parse(req.body));
         SRV_DBG("%s\n", "Request converted: OpenAI Responses -> OpenAI Chat Completions");
         SRV_DBG("converted request: %s\n", body.dump().c_str());
-        json body_parsed = oaicompat_chat_params_parse(
-            body,
-            meta->chat_params,
-            files);
+        json body_parsed;
+        {
+            std::lock_guard<std::mutex> lock(ctx_server.mutex_chat_params);
+            body_parsed = oaicompat_chat_params_parse(body, ctx_server.chat_params, files);
+        }
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
@@ -4925,8 +4967,10 @@ void server_routes::init_routes() {
 
     this->post_transcriptions_oai = [this](const server_http_req & req) {
         auto res = create_response();
+        // allow_audio / tmpls are immutable at runtime (only enable_thinking & kwargs change via POST /props)
+        const auto & chat_params = ctx_server.chat_params;
 
-        if (!meta->has_mtmd || !meta->chat_params.allow_audio) {
+        if (!meta->has_mtmd || !chat_params.allow_audio) {
             res->error(format_error_response("The current model does not support audio input.", ERROR_TYPE_NOT_SUPPORTED));
             return res;
         }
@@ -4934,15 +4978,16 @@ void server_routes::init_routes() {
         std::vector<raw_buffer> files;
         json body = convert_transcriptions_to_chatcmpl(
             json::parse(req.body),
-            meta->chat_params.tmpls.get(),
+            chat_params.tmpls.get(),
             req.files,
             files);
         SRV_DBG("%s\n", "Request converted: OpenAI Transcriptions -> OpenAI Chat Completions");
         SRV_DBG("converted request: %s\n", body.dump().c_str());
-        json body_parsed = oaicompat_chat_params_parse(
-            body,
-            meta->chat_params,
-            files);
+        json body_parsed;
+        {
+            std::lock_guard<std::mutex> lock(ctx_server.mutex_chat_params);
+            body_parsed = oaicompat_chat_params_parse(body, ctx_server.chat_params, files);
+        }
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
@@ -4957,10 +5002,11 @@ void server_routes::init_routes() {
         json body = server_chat_convert_anthropic_to_oai(json::parse(req.body));
         SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
         SRV_DBG("converted request: %s\n", body.dump().c_str());
-        json body_parsed = oaicompat_chat_params_parse(
-            body,
-            meta->chat_params,
-            files);
+        json body_parsed;
+        {
+            std::lock_guard<std::mutex> lock(ctx_server.mutex_chat_params);
+            body_parsed = oaicompat_chat_params_parse(body, ctx_server.chat_params, files);
+        }
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,
@@ -4978,10 +5024,11 @@ void server_routes::init_routes() {
         auto res = create_response();
         std::vector<raw_buffer> files; // dummy, unused
         json body = json::parse(req.body);
-        json data = oaicompat_chat_params_parse(
-            body,
-            meta->chat_params,
-            files);
+        json data;
+        {
+            std::lock_guard<std::mutex> lock(ctx_server.mutex_chat_params);
+            data = oaicompat_chat_params_parse(body, ctx_server.chat_params, files);
+        }
         res->ok({{ "prompt", std::move(data.at("prompt")) }});
         return res;
     };
@@ -5427,10 +5474,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_count_tokens(const l
             return res;
     }
 
-    json body_parsed = oaicompat_chat_params_parse(
-            body,
-            meta->chat_params,
-            files);
+    json body_parsed;
+    {
+        std::lock_guard<std::mutex> lock(ctx_server.mutex_chat_params);
+        body_parsed = oaicompat_chat_params_parse(body, ctx_server.chat_params, files);
+    }
     json prompt = body_parsed.at("prompt");
     // SRV_DBG("prompt = %s\n", prompt.dump().c_str());
 
@@ -5459,7 +5507,12 @@ void server_routes::update_cached_responses(bool is_sleeping) {
 
     if (is_sleeping) {
         cached_models  = get_res_models(*meta);
-        cached_props   = get_res_props(*meta, params, true);
+        bool enable_thinking;
+        {
+            std::lock_guard<std::mutex> lock(ctx_server.mutex_chat_params);
+            enable_thinking = ctx_server.chat_params.enable_thinking;
+        }
+        cached_props   = get_res_props(*meta, params, true, enable_thinking);
         cached_metrics = ctx_server.get_metrics();
 
         should_reset_buckets = false;

@@ -923,7 +923,17 @@ To use this endpoint with POST method, you need to start server with `--props`
 
 *Options:*
 
-- None yet
+- `enable_thinking`: Toggle the global thinking-mode default for the chat at runtime, without restarting the server. Accepts `true` (enable thinking), `false` (disable thinking), or `"auto"` (restore the template default). This changes the default for all subsequent requests; a single request can still override it via `chat_template_kwargs.enable_thinking` or `reasoning_effort`.
+
+*Examples:*
+
+```bash
+curl -X POST http://localhost:8080/props \
+     -H "Content-Type: application/json" \
+     -d '{"enable_thinking": false}'
+```
+
+The current value is reported by `GET /props` in the `enable_thinking` field.
 
 ### POST `/embeddings`: non-OpenAI-compatible embeddings API
 

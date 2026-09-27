@@ -176,6 +176,80 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+
+
+// Vectorized Q2_0 unpack helpers. These reproduce the exact same byte order as the
+// existing __byte_perm path in ggml_cuda_mmq_load_tiles_q2_0, so the shared-memory
+// tile is layout-identical and the ldmatrix+mma vec_dot can consume it unchanged.
+static __device__ __forceinline__ void mmq_unpack_q2_0_pair(uint32_t q, int & qx, int & qy) {
+    const int qe = __byte_perm(0x020100FF, 0x020100FF, q >> 0);
+    const int qo = __byte_perm(0x020100FF, 0x020100FF, q >> 2);
+    qx = __byte_perm(qe, qo, 0x5140);
+    qy = __byte_perm(qe, qo, 0x7362);
+}
+
+// Expand 4 packed bytes (16 x 2-bit values) into 4 ints (16 signed bytes).
+static __device__ __forceinline__ void mmq_unpack_q2_0_4bytes(uint32_t packed, int & v0, int & v1, int & v2, int & v3) {
+    mmq_unpack_q2_0_pair(packed & 0xFFFFu, v0, v1);
+    mmq_unpack_q2_0_pair(packed >> 16,     v2, v3);
+}
+
+// FAST_Q2: vectorized Q2_0 load for the MMQ kernel. Produces the exact same x_qs/x_df
+// shared-memory layout as ggml_cuda_mmq_load_tiles_q2_0, but unpacks 16 values per
+// 4-byte load instead of 8 values per 2-byte load. This is the mmq_q2_fast sandbox
+// optimization ported into the real ldmatrix+mma kernel.
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_q2_0_fast(
+        const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + 2*MMQ_TILE_NE_K);
+
+    // Data: each thread processes 4 bytes (16 values) and writes 4 consecutive ints.
+    // x_qs layout is [I][64] ints = 256 int8 values per row.
+#pragma unroll
+    for (int idx4 = (int) (threadIdx.y*warp_size + threadIdx.x); idx4 < I*16; idx4 += nwarps*warp_size) {
+        const int i   = idx4 / 16;
+        const int c16 = idx4 % 16;
+        const int ii  = fallback ? min(i, i_max) : i;
+        const int kk  = c16*16; // local K within the 256-K tile
+        const int kb  = kk / QK2_0;
+        const int m   = kk % QK2_0; // always a multiple of 16
+
+        const block_q2_0 * b = (const block_q2_0 *) x + kbx0 + ii*stride + kb;
+        const uint32_t packed = (uint32_t) b->qs[m/4]
+            | ((uint32_t) b->qs[m/4 + 1] << 8)
+            | ((uint32_t) b->qs[m/4 + 2] << 16)
+            | ((uint32_t) b->qs[m/4 + 3] << 24);
+        int v0, v1, v2, v3;
+        mmq_unpack_q2_0_4bytes(packed, v0, v1, v2, v3);
+        x_qs[i*sram_stride + c16*4 + 0] = v0;
+        x_qs[i*sram_stride + c16*4 + 1] = v1;
+        x_qs[i*sram_stride + c16*4 + 2] = v2;
+        x_qs[i*sram_stride + c16*4 + 3] = v3;
+    }
+
+    // Scales: identical to ggml_cuda_mmq_load_tiles_q2_0.
+    constexpr int blocks_per_iter = MMQ_ITER_K / QK2_0;
+    constexpr int scale_entries_per_block = QK2_0 / QK8_1;
+    constexpr int scale_entries_per_row = blocks_per_iter * scale_entries_per_block;
+    const int ksx = threadIdx.x % scale_entries_per_row;
+    const int scale_block = ksx / scale_entries_per_block;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nwarps) {
+        int i = i0 + threadIdx.y;
+        if (fallback) {
+            i = min(i, i_max);
+        }
+        const block_q2_0 * bxi = (const block_q2_0 *) x + kbx0 + i*stride + scale_block;
+        x_df[i*sram_stride + ksx] = bxi->d;
+    }
+}
+
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_q4_0(
         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     constexpr int warp_size   = ggml_cuda_get_physical_warp_size();

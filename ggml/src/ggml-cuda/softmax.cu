@@ -10,6 +10,10 @@
 #endif // GGML_USE_HIP
 
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <type_traits>
 #include <utility>
 
 template <typename T>
@@ -324,6 +328,488 @@ __launch_bounds__(8*WARP_SIZE, 1) static __global__ void soft_max_f32_paralleliz
     }
 }
 
+// ============================================================================
+// Optimized fast paths for the plain, contiguous, f32 case:
+//   scale == 1, no mask, no sinks, no ALiBi, row stride == ncols.
+// These are tried before the generic soft_max_f32 kernels:
+//   - one warp per row, whole row in registers                 (64 .. 1024)
+//   - one warp handles 16 rows, 2 lanes/row, ncols == 8        (NARROW8)
+// The build uses -use_fast_math, so expf() lowers to the SFU intrinsic.
+// ============================================================================
+#if defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wextra-semi"
+#endif // defined(__GNUC__)
+
+namespace {
+
+__device__ __forceinline__ float soft_max_fast_max4(const float4 v) {
+    return fmaxf(fmaxf(v.x, v.y), fmaxf(v.z, v.w));
+}
+
+// --- narrow rows: one warp per row, values kept in registers, vectorised ---
+template <int ITEMS, int WARPS>
+__global__ void soft_max_fast_warp_reg(const float * __restrict__ x, float * __restrict__ y,
+                                       int nrows, int ncols) {
+    const int lane = threadIdx.x & (WARP_SIZE - 1);
+    const int wid  = threadIdx.x / WARP_SIZE;
+    const int64_t row = (int64_t) blockIdx.x * WARPS + wid;
+    if (row >= nrows) {
+        return;
+    }
+
+    const float * xr = x + row * (int64_t) ncols;
+    float *       yr = y + row * (int64_t) ncols;
+
+    float v[ITEMS];
+    if constexpr (ITEMS % 4 == 0) {
+        const float4 * x4 = reinterpret_cast<const float4 *>(xr);
+#pragma unroll
+        for (int i = 0; i < ITEMS / 4; ++i) {
+            const float4 t = x4[lane + i * WARP_SIZE];
+            v[4 * i + 0] = t.x; v[4 * i + 1] = t.y; v[4 * i + 2] = t.z; v[4 * i + 3] = t.w;
+        }
+    } else if constexpr (ITEMS % 2 == 0) {
+        const float2 * x2 = reinterpret_cast<const float2 *>(xr);
+#pragma unroll
+        for (int i = 0; i < ITEMS / 2; ++i) {
+            const float2 t = x2[lane + i * WARP_SIZE];
+            v[2 * i + 0] = t.x; v[2 * i + 1] = t.y;
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < ITEMS; ++i) {
+            v[i] = xr[lane + i * WARP_SIZE];
+        }
+    }
+
+    float max_val = -INFINITY;
+#pragma unroll
+    for (int i = 0; i < ITEMS; ++i) {
+        max_val = fmaxf(max_val, v[i]);
+    }
+    max_val = warp_reduce_max(max_val);
+
+    float sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < ITEMS; ++i) {
+        v[i] = expf(v[i] - max_val);
+        sum += v[i];
+    }
+    sum = warp_reduce_sum(sum);
+    const float inv_sum = 1.0f / sum;
+
+    if constexpr (ITEMS % 4 == 0) {
+        float4 * y4 = reinterpret_cast<float4 *>(yr);
+#pragma unroll
+        for (int i = 0; i < ITEMS / 4; ++i) {
+            float4 o;
+            o.x = v[4 * i + 0] * inv_sum; o.y = v[4 * i + 1] * inv_sum;
+            o.z = v[4 * i + 2] * inv_sum; o.w = v[4 * i + 3] * inv_sum;
+            y4[lane + i * WARP_SIZE] = o;
+        }
+    } else if constexpr (ITEMS % 2 == 0) {
+        float2 * y2 = reinterpret_cast<float2 *>(yr);
+#pragma unroll
+        for (int i = 0; i < ITEMS / 2; ++i) {
+            float2 o;
+            o.x = v[2 * i + 0] * inv_sum;
+            o.y = v[2 * i + 1] * inv_sum;
+            y2[lane + i * WARP_SIZE] = o;
+        }
+    } else {
+#pragma unroll
+        for (int i = 0; i < ITEMS; ++i) {
+            yr[lane + i * WARP_SIZE] = v[i] * inv_sum;
+        }
+    }
+}
+
+// --- very narrow rows (ncols == 8): one warp handles 16 rows, 2 lanes per
+//     row, each lane loads one float4.  1 read + 1 write, no shared memory,
+//     no block sync.  Targets the real-model majority shape.
+template <int WARPS>
+__global__ void soft_max_fast_narrow8(const float * __restrict__ x, float * __restrict__ y, int nrows) {
+    const int lane = threadIdx.x & (WARP_SIZE - 1);
+    const int warp = threadIdx.x >> 5;
+    const int gwar = blockIdx.x * WARPS + warp;
+    const int row  = gwar * 16 + (lane >> 1);   // 16 rows per warp
+    const int half = lane & 1;                   // 0: first float4, 1: second float4
+
+    // keep all lanes active (avoid __shfl_sync full-mask UB); invalid rows
+    // participate with neutral values and skip the store.
+    const bool valid = row < nrows;
+    float4 v;
+    if (valid) {
+        v = *reinterpret_cast<const float4 *>(x + (size_t) row * 8 + half * 4);
+    } else {
+        v = make_float4(0.f, 0.f, 0.f, 0.f);
+    }
+
+    float m = valid ? soft_max_fast_max4(v) : -INFINITY;
+    m = fmaxf(m, __shfl_xor_sync(0xffffffff, m, 1));   // pair reduce -> row max
+
+    float e0 = 0.f, e1 = 0.f, e2 = 0.f, e3 = 0.f;
+    float s = 0.f;
+    if (valid) {
+        e0 = expf(v.x - m); e1 = expf(v.y - m);
+        e2 = expf(v.z - m); e3 = expf(v.w - m);
+        s  = e0 + e1 + e2 + e3;
+    }
+    s += __shfl_xor_sync(0xffffffff, s, 1);            // pair reduce -> row sum
+
+    const float inv = 1.0f / s;
+    if (valid) {
+        float4 o;
+        o.x = e0 * inv; o.y = e1 * inv; o.z = e2 * inv; o.w = e3 * inv;
+        *reinterpret_cast<float4 *>(y + (size_t) row * 8 + half * 4) = o;
+    }
+}
+
+
+static int soft_max_fast_max_threads_per_sm() {
+    static int cached_dev = -1;
+    static int cached_val = 0;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev != cached_dev) {
+        cudaDeviceGetAttribute(&cached_val, cudaDevAttrMaxThreadsPerMultiProcessor, dev);
+        cached_dev = dev;
+    }
+    return cached_val;
+}
+
+// Returns true if the operation was handled by one of the kernels above.
+static void soft_max_fast_debug(const char * tag, int nrows, int ncols) {
+    if (getenv("GGML_CUDA_FAST_DEBUG") == nullptr) {
+        return;
+    }
+    static std::mutex mtx;
+    static int seen[128][2] = {};
+    static int n_seen = 0;
+    std::lock_guard<std::mutex> lk(mtx);
+    for (int i = 0; i < n_seen; ++i) {
+        if (seen[i][0] == ncols && seen[i][1] == nrows) {
+            return;
+        }
+    }
+    if (n_seen < 128) {
+        seen[n_seen][0] = ncols;
+        seen[n_seen][1] = nrows;
+        ++n_seen;
+        fprintf(stderr, "[fastsoftmax] %s ncols=%d nrows=%d\n", tag, ncols, nrows);
+    }
+}
+
+// =====================================================================
+// Fast-path decision logging (GGML_CUDA_FAST_LOG).
+// Records, at every fast-path threshold decision, the full execution
+// conditions plus the chosen kernel / fallback reason, so a real model
+// run can confirm whether the fast path is used and what conditions
+// actually need optimization.
+//   GGML_CUDA_FAST_LOG=1        -> emit to stderr, dedup by condition
+//   GGML_CUDA_FAST_LOG=<path>   -> append to file, dedup by condition
+//   value containing "full"     -> emit every occurrence (no dedup)
+// Default off; when off there is only a single boolean check per call.
+// =====================================================================
+enum soft_max_fast_decision {
+    SOFT_MAX_FAST_WARP    = 2,
+    SOFT_MAX_FAST_NARROW8 = 12,
+    SOFT_MAX_GEN_SHARED   = 6,
+    SOFT_MAX_GEN_FALLBACK = 7,
+    SOFT_MAX_COOP         = 8,
+    SOFT_MAX_DISABLED     = 9,
+    SOFT_MAX_NO_MATCH     = 10,
+    SOFT_MAX_BACKWARD     = 11,
+};
+
+static const char * soft_max_fast_decision_name(int d) {
+    switch (d) {
+        case SOFT_MAX_FAST_WARP:    return "WARP";
+        case SOFT_MAX_FAST_NARROW8: return "NARROW8";
+        case SOFT_MAX_GEN_SHARED:   return "GEN_SHARED";
+        case SOFT_MAX_GEN_FALLBACK: return "GEN_FALLBACK";
+        case SOFT_MAX_COOP:         return "COOP";
+        case SOFT_MAX_DISABLED:     return "DISABLED";
+        case SOFT_MAX_NO_MATCH:     return "NO_MATCH";
+        case SOFT_MAX_BACKWARD:     return "BACKWARD";
+        default:                    return "?";
+    }
+}
+
+#define SOFT_MAX_FAST_LOG_MAX 1024
+
+static bool   soft_max_fast_log_enabled = false;
+static bool   soft_max_fast_log_full    = false;
+static FILE * soft_max_fast_log_fp      = nullptr;
+
+static void soft_max_fast_log_dump_summary();
+
+static void soft_max_fast_log_init() {
+    static std::once_flag once;
+    std::call_once(once, []() {
+        const char * v = getenv("GGML_CUDA_FAST_LOG");
+        if (v == nullptr) {
+            return;
+        }
+        soft_max_fast_log_enabled = true;
+        soft_max_fast_log_full    = (strstr(v, "full") != nullptr);
+        if (strcmp(v, "1") == 0 || strcmp(v, "full") == 0) {
+            soft_max_fast_log_fp = stderr;
+        } else {
+            soft_max_fast_log_fp = fopen(v, "a");
+            if (soft_max_fast_log_fp == nullptr) {
+                soft_max_fast_log_fp = stderr;
+            }
+        }
+        std::atexit(soft_max_fast_log_dump_summary);
+    });
+}
+
+static std::mutex soft_max_fast_log_mtx;
+
+struct soft_max_fast_log_key {
+    int64_t ncols;
+    int64_t nrows;
+    uint8_t contiguous;
+    uint8_t mask_type;         // 0 none, 1 f32, 2 f16
+    uint8_t has_sinks;
+    uint8_t coop_would_apply;
+    float   scale;
+    float   max_bias;
+    uint8_t decision;
+};
+
+static soft_max_fast_log_key soft_max_fast_log_keys[SOFT_MAX_FAST_LOG_MAX] = {};
+static uint64_t              soft_max_fast_log_counts[SOFT_MAX_FAST_LOG_MAX] = {};
+static int                   soft_max_fast_log_n = 0;
+
+// --- aggregate histograms for shape-discovery / decision coverage ---
+// Keyed by ncols (forward) and by decision id.  These are always accumulated
+// (even in dedup mode) so a post-run summary can answer:
+//   - which ncols actually appear and how often
+//   - how many calls actually went through a designed fast path vs fallback
+static int64_t  soft_max_fast_log_ncols[SOFT_MAX_FAST_LOG_MAX] = {};
+static uint64_t soft_max_fast_log_ncols_count[SOFT_MAX_FAST_LOG_MAX] = {};
+static int      soft_max_fast_log_ncols_n = 0;
+
+static uint64_t soft_max_fast_log_decision_count[SOFT_MAX_FAST_LOG_MAX] = {};
+static uint64_t soft_max_fast_log_total_calls = 0;
+
+static void soft_max_fast_log_dump_summary() {
+    if (!soft_max_fast_log_enabled) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(soft_max_fast_log_mtx);
+    FILE * fp = soft_max_fast_log_fp ? soft_max_fast_log_fp : stderr;
+    fprintf(fp, "[fastlog] SUMMARY total_calls=%llu\n",
+            (unsigned long long) soft_max_fast_log_total_calls);
+
+    // per-ncols forward histogram
+    for (int i = 0; i < soft_max_fast_log_ncols_n; ++i) {
+        fprintf(fp, "[fastlog] SUM ncols=%lld calls=%llu\n",
+                (long long) soft_max_fast_log_ncols[i],
+                (unsigned long long) soft_max_fast_log_ncols_count[i]);
+    }
+
+    // per-decision histogram (fast vs fallback coverage)
+    for (int d = 0; d <= SOFT_MAX_FAST_NARROW8; ++d) {
+        const uint64_t c = soft_max_fast_log_decision_count[d];
+        if (c == 0) {
+            continue;
+        }
+        fprintf(fp, "[fastlog] SUM decision=%s calls=%llu\n",
+                soft_max_fast_decision_name(d), (unsigned long long) c);
+    }
+}
+
+static void soft_max_fast_log_decision(int64_t nrows, int64_t ncols, bool contiguous, int mask_type,
+                                       bool has_sinks, float scale, float max_bias,
+                                       bool coop_would_apply, int decision, const char * reason) {
+    if (!soft_max_fast_log_enabled) {
+        return;
+    }
+
+    soft_max_fast_log_key k;
+    k.ncols            = ncols;
+    k.nrows            = nrows;
+    k.contiguous       = contiguous ? 1 : 0;
+    k.mask_type        = (uint8_t) mask_type;
+    k.has_sinks        = has_sinks ? 1 : 0;
+    k.coop_would_apply = coop_would_apply ? 1 : 0;
+    k.scale            = scale;
+    k.max_bias         = max_bias;
+    k.decision         = (uint8_t) decision;
+
+    std::lock_guard<std::mutex> lk(soft_max_fast_log_mtx);
+
+    // aggregate histograms (always, even in dedup mode)
+    soft_max_fast_log_total_calls++;
+    if (decision >= 0 && decision <= SOFT_MAX_FAST_NARROW8) {
+        soft_max_fast_log_decision_count[decision]++;
+    }
+    {
+        int ni = -1;
+        for (int i = 0; i < soft_max_fast_log_ncols_n; ++i) {
+            if (soft_max_fast_log_ncols[i] == ncols) {
+                ni = i;
+                break;
+            }
+        }
+        if (ni < 0) {
+            if (soft_max_fast_log_ncols_n < SOFT_MAX_FAST_LOG_MAX) {
+                ni = soft_max_fast_log_ncols_n++;
+                soft_max_fast_log_ncols[ni] = ncols;
+                soft_max_fast_log_ncols_count[ni] = 0;
+            }
+        }
+        if (ni >= 0) {
+            soft_max_fast_log_ncols_count[ni]++;
+        }
+    }
+
+    int idx = -1;
+    for (int i = 0; i < soft_max_fast_log_n; ++i) {
+        if (memcmp(&soft_max_fast_log_keys[i], &k, sizeof(k)) == 0) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx < 0) {
+        if (soft_max_fast_log_n >= SOFT_MAX_FAST_LOG_MAX) {
+            return;
+        }
+        idx = soft_max_fast_log_n++;
+        soft_max_fast_log_keys[idx]     = k;
+        soft_max_fast_log_counts[idx]   = 0;
+    }
+    soft_max_fast_log_counts[idx]++;
+
+    if (soft_max_fast_log_full || soft_max_fast_log_counts[idx] == 1) {
+        FILE * fp = soft_max_fast_log_fp ? soft_max_fast_log_fp : stderr;
+        fprintf(fp, "[fastlog] DEC ncols=%lld nrows=%lld contig=%d mask=%d sinks=%d scale=%.4f maxbias=%.4f coop=%d => %s%s%s count=%llu\n",
+                (long long) ncols, (long long) nrows,
+                (int) k.contiguous, (int) k.mask_type, (int) k.has_sinks,
+                k.scale, k.max_bias, (int) k.coop_would_apply,
+                soft_max_fast_decision_name(decision),
+                (reason && reason[0]) ? " " : "",
+                reason ? reason : "",
+                (unsigned long long) soft_max_fast_log_counts[idx]);
+    }
+}
+
+// Backward has no fast path; only record per-ncols call counts.
+static void soft_max_fast_log_backward(int ncols, int nrows) {
+    if (!soft_max_fast_log_enabled) {
+        return;
+    }
+    std::lock_guard<std::mutex> lk(soft_max_fast_log_mtx);
+    static int      b_ncols[SOFT_MAX_FAST_LOG_MAX] = {};
+    static uint64_t b_counts[SOFT_MAX_FAST_LOG_MAX] = {};
+    static int      b_n = 0;
+
+    int idx = -1;
+    for (int i = 0; i < b_n; ++i) {
+        if (b_ncols[i] == ncols) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx < 0) {
+        if (b_n >= SOFT_MAX_FAST_LOG_MAX) {
+            return;
+        }
+        idx = b_n++;
+        b_ncols[idx]   = ncols;
+        b_counts[idx]  = 0;
+    }
+    b_counts[idx]++;
+
+    if (soft_max_fast_log_full || b_counts[idx] == 1) {
+        FILE * fp = soft_max_fast_log_fp ? soft_max_fast_log_fp : stderr;
+        fprintf(fp, "[fastlog] BACKWARD ncols=%d nrows=%d count=%llu\n", ncols, nrows,
+                (unsigned long long) b_counts[idx]);
+    }
+}
+
+// Runtime WARPS selection for the ncols=8 fast kernel.
+// WARPS=8 (256 threads/block) is the default; CMP 170HX (2048 threads/SM)
+// uses WARPS=16 (512 threads/block) for large row counts to improve occupancy.
+// SOFTMAX_NARROW8_WARPS=<n> overrides for experiments.
+static void launch_soft_max_fast_narrow8(const float * x, float * y, int nrows, int warps, cudaStream_t stream) {
+    const int rows_per_block = warps * 16;
+    const dim3 grid((nrows + rows_per_block - 1) / rows_per_block);
+    switch (warps) {
+        case 8:
+            soft_max_fast_narrow8<8><<<grid, 8 * WARP_SIZE, 0, stream>>>(x, y, nrows);
+            break;
+        case 16:
+            soft_max_fast_narrow8<16><<<grid, 16 * WARP_SIZE, 0, stream>>>(x, y, nrows);
+            break;
+        default:
+            soft_max_fast_narrow8<8><<<grid, 8 * WARP_SIZE, 0, stream>>>(x, y, nrows);
+            break;
+    }
+}
+
+static bool soft_max_try_fast(const float * x, float * y, int nrows, int ncols, cudaStream_t stream,
+                              int * out_decision) {
+    if (!ggml_cuda_fast_ops_enabled("GGML_CUDA_FAST_SOFTMAX") || nrows <= 0 || ncols <= 0) {
+        *out_decision = SOFT_MAX_DISABLED;
+        return false;
+    }
+
+    // ncols == 8: very narrow rows, one warp handles 16 rows, 2 lanes/row
+    if (ncols == 8) {
+        soft_max_fast_debug("narrow8", nrows, ncols);
+        int warps = 8;
+        const char * env = getenv("SOFTMAX_NARROW8_WARPS");
+        if (env) {
+            warps = atoi(env);
+        } else if (nrows > 128 && soft_max_fast_max_threads_per_sm() >= 2048) {
+            warps = 16;   // CMP 170HX: 2048 threads/SM -> more warps/block
+        }
+        *out_decision = SOFT_MAX_FAST_NARROW8;
+        launch_soft_max_fast_narrow8(x, y, nrows, warps, stream);
+        return true;
+    }
+
+    // narrow rows: one warp per row, row in registers
+    switch (ncols) {
+        case 64:   *out_decision = SOFT_MAX_FAST_WARP; soft_max_fast_warp_reg<2,  8><<<(nrows + 7) / 8, 256, 0, stream>>>(x, y, nrows, ncols); return true;
+        case 128:  *out_decision = SOFT_MAX_FAST_WARP; soft_max_fast_debug("warp", nrows, ncols); soft_max_fast_warp_reg<4,  8><<<(nrows + 7) / 8, 256, 0, stream>>>(x, y, nrows, ncols); return true;
+        case 256:  *out_decision = SOFT_MAX_FAST_WARP; soft_max_fast_debug("warp", nrows, ncols); soft_max_fast_warp_reg<8,  8><<<(nrows + 7) / 8, 256, 0, stream>>>(x, y, nrows, ncols); return true;
+        case 512:  *out_decision = SOFT_MAX_FAST_WARP; soft_max_fast_debug("warp", nrows, ncols); soft_max_fast_warp_reg<16, 8><<<(nrows + 7) / 8, 256, 0, stream>>>(x, y, nrows, ncols); return true;
+        case 1024: *out_decision = SOFT_MAX_FAST_WARP; soft_max_fast_warp_reg<32, 4><<<(nrows + 3) / 4, 128, 0, stream>>>(x, y, nrows, ncols); return true;
+        default: break;
+    }
+
+
+    const int    id    = ggml_cuda_get_device();
+    const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+
+
+    // Anything that still fits in shared memory is left to the generic
+    // soft_max_f32 kernels (they keep the row in SMEM, 1 read + 1 write).
+    // The online/hybrid/reg paths were removed because the target model logs
+    // only use ncols == 8 and ncols == 128 (see softmax_op/README.md §9.6).
+    if ((size_t) (GGML_PAD(ncols, WARP_SIZE) + WARP_SIZE) * sizeof(float) <= smpbo) {
+        soft_max_fast_debug("SKIP-fits-smem", nrows, ncols);
+        *out_decision = SOFT_MAX_GEN_SHARED;
+        return false;
+    }
+
+
+    *out_decision = SOFT_MAX_NO_MATCH;
+    return false;
+}
+
+#if defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif // defined(__GNUC__)
+
+} // namespace
+
 template <typename T>
 static void soft_max_f32_cuda(const float *                                x,
                               const T *                                    mask,
@@ -331,7 +817,8 @@ static void soft_max_f32_cuda(const float *                                x,
                               float *                                      dst,
                               const soft_max_params &                      params,
                               cudaStream_t                                 stream,
-                              [[maybe_unused]] ggml_backend_cuda_context & ctx) {
+                              [[maybe_unused]] ggml_backend_cuda_context & ctx,
+                              const bool                                   contiguous) {
     int nth = WARP_SIZE;
     const int64_t ncols_x = params.ncols;
 
@@ -345,6 +832,68 @@ static void soft_max_f32_cuda(const float *                                x,
     const int id       = ggml_cuda_get_device();
     const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
 
+    // Optimized fast paths for the plain, contiguous, mask-free case.  They are
+    // skipped when the cooperative row-parallel path below would be selected,
+    // because that path targets very large ncols with very few rows.
+    if (getenv("GGML_CUDA_FAST_DEBUG") != nullptr &&
+        !(contiguous && mask == nullptr && sinks == nullptr && params.scale == 1.0f && params.max_bias == 0.0f)) {
+        fprintf(stderr, "[fastsoftmax] NOFAST ncols=%d nrows=%d contig=%d mask=%d sinks=%d scale=%.4f maxbias=%.4f\n",
+                (int) ncols_x, (int) (params.ne01*params.ne02*params.ne03),
+                (int) contiguous, (int) (mask != nullptr), (int) (sinks != nullptr), params.scale, params.max_bias);
+    }
+
+    // ---- fast-path threshold decision + logging (GGML_CUDA_FAST_LOG) ----
+    soft_max_fast_log_init();
+
+    const bool fast_eligible =
+        contiguous && mask == nullptr && sinks == nullptr &&
+        params.scale == 1.0f && params.max_bias == 0.0f &&
+        ncols_x > 0 && ncols_x <= INT32_MAX;
+
+    const int64_t nrows_x = params.ne01 * params.ne02 * params.ne03;
+    const bool coop_would_apply =
+        ggml_cuda_info().devices[id].supports_cooperative_launch &&
+        nrows_x > 0 && ncols_x / nrows_x > 8192;
+
+    const int mask_type = (mask != nullptr) ? (std::is_same<T, half>::value ? 2 : 1) : 0;
+
+    int  decision = SOFT_MAX_GEN_FALLBACK;
+    const char * reason = nullptr;
+
+    if (!fast_eligible) {
+        if (!contiguous)                reason = "contiguous=false";
+        else if (mask)                  reason = "mask";
+        else if (sinks)                 reason = "sinks";
+        else if (params.scale != 1.0f)  reason = "scale!=1";
+        else if (params.max_bias != 0.0f) reason = "alibi";
+        else                            reason = "invalid-ncols";
+        decision = SOFT_MAX_GEN_FALLBACK;
+    } else if (coop_would_apply) {
+        decision = SOFT_MAX_COOP;
+        reason   = "coop";
+        if (getenv("GGML_CUDA_FAST_DEBUG") != nullptr) {
+            fprintf(stderr, "[fastsoftmax] SKIP coop ncols=%d nrows=%d\n", (int) ncols_x, (int) nrows_x);
+        }
+    } else if (nrows_x <= 0 || nrows_x > INT32_MAX) {
+        decision = SOFT_MAX_GEN_FALLBACK;
+        reason   = "nrows-invalid";
+    } else {
+        int d = SOFT_MAX_GEN_FALLBACK;
+        const bool used = soft_max_try_fast(x, dst, (int) nrows_x, (int) ncols_x, stream, &d);
+        decision = d;
+        if (used) {
+            soft_max_fast_log_decision(nrows_x, ncols_x, contiguous, mask_type,
+                                       sinks != nullptr, params.scale, params.max_bias,
+                                       coop_would_apply, decision, nullptr);
+            return;
+        }
+        reason = (d == SOFT_MAX_GEN_SHARED) ? "SKIP-fits-smem" : "no-fast-path";
+    }
+
+    // generic soft_max_f32 kernels will handle this call; log the fallback decision
+    soft_max_fast_log_decision(nrows_x, ncols_x, contiguous, mask_type,
+                               sinks != nullptr, params.scale, params.max_bias,
+                               coop_would_apply, decision, reason);
 
     if (nbytes_shared <= smpbo) {
         launch_soft_max_kernels<32, 64, 128, 256, 512, 1024, 2048, 4096>(x, mask, sinks, dst, params, stream, block_dims, block_nums, nbytes_shared);
@@ -374,6 +923,9 @@ static void soft_max_f32_cuda(const float *                                x,
 static void soft_max_back_f32_cuda(
         const float * grad, const float * dstf, float * dst,
         const int ncols, const int nrows, const float scale, cudaStream_t stream) {
+    soft_max_fast_log_init();
+    soft_max_fast_log_backward(ncols, nrows);
+
     const dim3 block_dims(WARP_SIZE, 1, 1);
     const dim3 block_nums(nrows,     1, 1);
 
@@ -424,6 +976,14 @@ void ggml_cuda_op_soft_max(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
 
 
+    // The optimized fast paths require plain row-major f32 rows with stride ncols.
+    const bool contiguous =
+        src0->nb[0] == (size_t) sizeof(float) &&
+        dst->nb[0]  == (size_t) sizeof(float) &&
+        src0->nb[1] == (size_t) ne00 * sizeof(float) &&
+        dst->nb[1]  == (size_t) ne00 * sizeof(float) &&
+        dst->ne[0]  == ne00;
+
     soft_max_params params = {};
     params.nheads = src0->ne[2];
     params.n_head_log2 = n_head_log2;
@@ -445,9 +1005,9 @@ void ggml_cuda_op_soft_max(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     params.m1 = m1;
 
     if (use_f16) {
-        soft_max_f32_cuda(src0_d, (const half *) src1_d, (const float *) src2_d, dst_d, params, stream, ctx);
+        soft_max_f32_cuda(src0_d, (const half *) src1_d, (const float *) src2_d, dst_d, params, stream, ctx, contiguous);
     } else {
-        soft_max_f32_cuda(src0_d, (const float *) src1_d, (const float *) src2_d, dst_d, params, stream, ctx);
+        soft_max_f32_cuda(src0_d, (const float *) src1_d, (const float *) src2_d, dst_d, params, stream, ctx, contiguous);
     }
 }
 
