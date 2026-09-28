@@ -4,7 +4,9 @@ A fork of https://github.com/ggml-org/llama.cpp
 
 # fixds4 分支简介
 
-针对在 **Ampere 系 GPU（CMP 170HX / RTX 3080 / A4000）** 上运行 **DeepSeek-V4-Flash（IQ2_XXS / Q2_K 专家权重）** 的推理场景，为 llama.cpp 的 ggml-cuda 后端加入了一批手写算子快速路径。
+针对在 **Ampere 系 GPU（CMP 170HX / RTX 3080 / A4000）** 上运行 **DeepSeek-V4-Flash（IQ2_XXS / Q2_K 专家权重）** 的推理场景，为 llama.cpp 的 ggml-cuda 后端加入了一批手写算子快速路径。目前的算子改进实现了 **prefill速度 +45%**，decode速度无可感改进。
+
+（巧的是项目开发期间llama.cpp也有性能优化，大概decode +3%左右、prefill +20%，而且能和我的优化算子效果叠加，所以我直接同步到尽量新的llama.cpp版本了）
 
 优化遵循「**不动原实现、前面加可开关的 gated fast path**」原则：只在全部触发条件满足时走快速路径，否则原样落回通用 kernel，**zero regression risk**。所有快速路径按**功能**命名。
 
@@ -33,8 +35,17 @@ A fork of https://github.com/ggml-org/llama.cpp
 
 MoE MM 的瓶颈是**分层**的，逐层做了三项优化：
 
-- **O1 —— 消除调度层 sync-fallback 悬崖**：MoE ids 分支 T≥64 时直接走 mmq，不再经过 2×sync + CPU 往返 + 逐 expert 发射 + 禁用 CUDA graph 的兜底路径（`mul_mat_id_needs_sync` 对该场景直接返回 false）。
-- **O2 —— 消除工作形状层 mma 浪费**：按每个 expert 的实际活跃行数（col_diff）把专家分进几个桶，每桶用「刚好 ≥ 桶内最大 col_diff 的 J」发射，砍掉全局 J≥T 发射为每个专家付出的 `J/col_diff` 空转；y 按桶重排（gather），mmq kernel 保持连续加载。
+- **O1 —— 消除调度层 sync-fallback 悬崖**：
+
+  MoE ids 分支在 token 数 T≥64 时，stock 会掉进一条「调度悬崖」：`mul_mat_id_needs_sync` 返回 true，触发 **2×stream sync + CPU 往返 + 逐 expert 发射 kernel + 禁用 CUDA graph 捕获** 的兜底路径，发射/同步开销巨大。
+
+  O1 让 `mul_mat_id_needs_sync` 对该场景（src1 为 f32、dst 为 f32、src0 为量化类型、`ne[2] ≥ MMQ_DP4A_MAX_BATCH_SIZE`、且 `should_use_mmq` 成立）**直接返回 false**，从而跳过整条兜底路径，改由 `mul_mat_id` 直接发射 mmq kernel（J=8..128 逐档），并保住 CUDA graph 捕获。收益来自砍掉发射/同步开销，与 kernel 本身无关。
+
+- **O2 —— 消除工作形状层 mma 浪费**：
+
+  stock 用「全局 J≥T」发射 mmq：J-tile 必须盖住最大的活跃行数，而每个 expert 实际只分到 col_diff 行，于是每个专家都付出 `J/col_diff` 的 **mma 空转**（时间 ∝ E_act×J）。
+
+  O2 在宿主端按每个 expert 的实际活跃行数（col_diff）把专家**分进 4 个桶**，每桶用「刚好 ≥ 桶内最大 col_diff 的 J」发射（`switch_J` 逐档选 J），把空转压到每桶只多一点点。为让 mmq kernel 保持快速连续加载，y 按桶**重排（gather）**成局部紧凑布局、每 k-block 补 pad=128 填充行，只有权重 expert id 需要间接寻址（expert_ids）。收益集中在**削减每个专家付出的 mma 空转**，是端到端收益的第二个主体。
 - **O5 —— 消除数据解包层 ALU 瓶颈**：Q2_0 向量化解包，一次 4 字节加载解出 16 个值（原 2 字节解 8 个），shared-memory tile 布局与原 `__byte_perm` 路径逐字节一致，`ldmatrix+mma` 可原样消费。
 
 ## 端到端收益（真实模型实测）
