@@ -74,5 +74,5 @@ MoE MM 的瓶颈是**分层**的，逐层做了三项优化：
 
 ## 说明
 
-- 本分支已经同步到 llama.cpp 基线 [`2539badcb`](https://github.com/ggml-org/llama.cpp/commit/136887b665180c13c6209a4ce0673637b6cd3afd) & https://github.com/ggml-org/llama.cpp/releases/tag/b11221。
+- 本分支的fork起点已经更新到 llama.cpp 基线 [`2539badcb`](https://github.com/ggml-org/llama.cpp/commit/136887b665180c13c6209a4ce0673637b6cd3afd) & https://github.com/ggml-org/llama.cpp/releases/tag/b11221。
 - 改动集中在 `ggml/src/ggml-cuda/`；不涉及 `ggml.h` / `ggml.c` / `src/llama-graph.cpp`。
