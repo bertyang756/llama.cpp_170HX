@@ -50,13 +50,14 @@ MoE MM 的瓶颈是**分层**的，逐层做了三项优化：
   stock 用「全局 J≥T」发射 mmq：J-tile 必须盖住最大的活跃行数，而每个 expert 实际只分到 col_diff 行，于是每个专家都付出 `J/col_diff` 的 **mma 空转**（时间 ∝ E_act×J）。
 
   O2 在宿主端按每个 expert 的实际活跃行数（col_diff）把专家**分进 4 个桶**，每桶用「刚好 ≥ 桶内最大 col_diff 的 J」发射（`switch_J` 逐档选 J），把空转压到每桶只多一点点。为让 mmq kernel 保持快速连续加载，y 按桶**重排（gather）**成局部紧凑布局、每 k-block 补 pad=128 填充行，只有权重 expert id 需要间接寻址（expert_ids）。收益集中在**削减每个专家付出的 mma 空转**，是端到端收益的第二个主体。
+  
 - **O5 —— 消除数据解包层 ALU 瓶颈**：Q2_0 向量化解包，一次 4 字节加载解出 16 个值（原 2 字节解 8 个），shared-memory tile 布局与原 `__byte_perm` 路径逐字节一致，`ldmatrix+mma` 可原样消费。
 
 ## 端到端收益（真实模型实测）
 
-- **prefill**：3 卡 KV Q8 `262.54 → 379.9`（**~1.45×**）；2 卡 KV default `156.01 → 187.65`（**~1.20×**），即提交信息中的 **prefill +45%**。
+- **prefill**：3 卡 KV Q8 `262.54 → 379.9`（**~1.45×**），即提交信息中的 **prefill +45%**（基于开发中的llama.cpp版本基线）。同步新的llama.cpp版本之后，prefill更高一些。
 - **decode**：基本持平（±1% 噪声内），MoE MM 只改善 prefill（decode 走 mmvq 路径）。
-- 收益主体是 MoE MM 的 O1/O2；softmax 加速端到端无感，O5 单独在当前 IQ2_XXS/Q2_K 模型上也无端到端收益（它覆盖的 Q2_0 不是当前模型类型）。
+- 收益主体是 MoE MM 的 O1/O2；softmax 加速端到端无感，O5 单独在当前 IQ2_XXS/Q2_K 模型上也无端到端收益（它覆盖的 Q2_0 不是当前模型类型，但理论提升挺大的所以先保留了）。
 
 ## 构建与用法
 
