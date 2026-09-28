@@ -48,7 +48,15 @@ MoE MM 的瓶颈是**分层**的，逐层做了三项优化：
 - 集成目标测试通过**CUDA 13.3**+`CMAKE_CUDA_ARCHITECTURES="80;86"`（没有用到什么高级特性，其他CUDA版本和GPU架构理论上也可以用）。
 - A/B：`GGML_CUDA_FAST_OPS=0`（stock）对照 `GGML_CUDA_FAST_<OP>=0`（单算子）。
 
+## 对于新架构的GPU的适配程度分析
+- Softmax：纯 thread-level CUDA（warp 每行、寄存器驻留、float4 加载、expf），无架构专属指令，可直接迁移；但收益只在 kernel 级访存带宽，端到端非瓶颈，新卡上大概率依旧无感。
+- MoE MM O1：纯宿主端调度优化（跳过 2×sync + CPU 往返 + 逐 expert 发射），架构无关；新卡算力越快这类发射/同步开销占比越大，最可能在新卡上保持甚至放大提速。
+- MoE MM O2：分桶削 J/col_diff 的 mma 浪费，机制所有 tensor-core 架构通用；但分桶阈值/J≤128/pad 是 Ampere 调的，新卡要重调参才拿满。
+- MoE MM O5：__byte_perm+4 字节加载解 16 值，NVIDIA 全系可移植；但只覆盖 Q2_0，当前模型是 IQ2_XXS/Q2_K，任何架构端到端都无收益。
+
+所以优先推荐复现 **MoE MM O1**，其次愿意做一点测试确认最优参数的话复现 **MoE MM O2**。
+
 ## 说明
 
-- 本分支基于 llama.cpp 基线 `2539badcb` 开发，后已合并上游并解决 mmq 冲突。
+- 本分支已经同步到 llama.cpp 基线 [`2539badcb`](https://github.com/ggml-org/llama.cpp/commit/136887b665180c13c6209a4ce0673637b6cd3afd) & https://github.com/ggml-org/llama.cpp/releases/tag/b11221。
 - 改动集中在 `ggml/src/ggml-cuda/`；不涉及 `ggml.h` / `ggml.c` / `src/llama-graph.cpp`。
