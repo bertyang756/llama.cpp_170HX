@@ -8,6 +8,8 @@ A fork of https://github.com/ggml-org/llama.cpp
 
 （巧的是项目开发期间llama.cpp也有性能优化，大概decode +3%左右、prefill +20%，而且能和我的优化算子效果叠加，所以我直接同步到尽量新的llama.cpp版本了）
 
+目标模型：https://hf-mirror.com/antirez/deepseek-v4-gguf 中的 DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf
+
 优化遵循「**不动原实现、前面加可开关的 gated fast path**」原则：只在全部触发条件满足时走快速路径，否则原样落回通用 kernel，**zero regression risk**。所有快速路径按**功能**命名。
 
 ## 集成的优化点
@@ -23,7 +25,7 @@ A fork of https://github.com/ggml-org/llama.cpp
 
 ### 2. Softmax 快速路径（`softmax.cu`）
 
-为「连续、f32、scale==1、无 mask、无 sinks、无 ALiBi」的常规 SOFT_MAX 场景按列宽分档特化：
+为「连续、f32、scale==1、无 mask、无 sinks、无 ALiBi」的常规 SOFT_MAX 场景（目标模型中会用到的）按列宽分档特化：
 
 - `NARROW8`：ncols==8 专项，一个 warp 并行处理 16 行、每行 2 lane，寄存器驻留 + 向量化；
 - `WARP-REG` / `TINY` / `REG` / `HYBRID` / `ONLINE`：覆盖中等到超大列宽的寄存器 / shared-memory / online 归约变体；
@@ -32,6 +34,8 @@ A fork of https://github.com/ggml-org/llama.cpp
 收益集中在 **kernel 级访存带宽占比**（如 ncols=8 在大 nrows 下三卡 14.9× / 17.2× / 21.3×，%copy 89~94%）；端到端上 softmax 不是这几张卡的瓶颈（<0.5%）。
 
 ### 3. MoE 量化专家 matmul（`mmq.cu` / `mmq.cuh` / `mmq-load-tiles.cuh`）
+
+针对目标模型的专家设置（每层256个专家，每token激活6个）
 
 MoE MM 的瓶颈是**分层**的，逐层做了三项优化：
 
